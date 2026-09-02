@@ -17,3 +17,16 @@ TELEGRAM_SERVICE_BOT_TOKEN = os.getenv("TELEGRAM_SERVICE_BOT_TOKEN", "")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 
 RAG_CONFIDENCE_THRESHOLD = float(os.getenv("RAG_CONFIDENCE_THRESHOLD", "0.75"))
+
+# Слова, при упоминании которых бот СРАЗУ передаёт диалог оператору,
+# независимо от того, есть ли ответ в базе знаний. Раньше эскалация
+# срабатывала на ЛЮБОЙ вопрос без совпадения в базе — теперь только на
+# явный запрос человека.
+ESCALATION_KEYWORDS = [
+    kw.strip().lower()
+    for kw in os.getenv(
+        "ESCALATION_KEYWORDS",
+        "оператор,менеджер,живой человек,позовите человека,поговорить с человеком,human,operator",
+    ).split(",")
+    if kw.strip()
+]
