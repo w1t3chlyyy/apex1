@@ -2,7 +2,18 @@ from supabase import create_client
 import config
 import gemini_client
 
-supabase = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
+_supabase = None
+
+
+def get_supabase():
+    global _supabase
+    if _supabase is None:
+        if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
+            raise RuntimeError(
+                "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY не заданы в переменных окружения"
+            )
+        _supabase = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
+    return _supabase
 
 
 def search_knowledge_base(bot_id: str, question: str, match_count: int = 3):
@@ -13,6 +24,7 @@ def search_knowledge_base(bot_id: str, question: str, match_count: int = 3):
     Возвращает (context_text, best_similarity) — конкатенированный контекст
     и максимальную схожесть среди найденных фрагментов.
     """
+    supabase = get_supabase()
     embedding = gemini_client.embed_text(question)
 
     response = supabase.rpc(
