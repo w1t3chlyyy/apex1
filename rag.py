@@ -1,6 +1,6 @@
 from supabase import create_client
 import config
-import gemini_client
+import qwen_client
 
 _supabase = None
 
@@ -20,12 +20,14 @@ def search_knowledge_base(bot_id: str, question: str, match_count: int = 3):
     """
     Векторный поиск по базе знаний конкретного бота через Supabase RPC-функцию
     `match_knowledge_base` (см. schema.sql), использующую pgvector <-> оператор.
+    Эмбеддинги теперь генерируются через Qwen (text-embedding-v3, 1024 измерения) —
+    см. lib/supabase/schema.sql, столбец embedding обновлён до vector(1024).
 
     Возвращает (context_text, best_similarity) — конкатенированный контекст
     и максимальную схожесть среди найденных фрагментов.
     """
     supabase = get_supabase()
-    embedding = gemini_client.embed_text(question)
+    embedding = qwen_client.embed_text(question)
 
     response = supabase.rpc(
         "match_knowledge_base",
