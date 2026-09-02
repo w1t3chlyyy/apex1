@@ -100,6 +100,11 @@ async def business_webhook(bot_id: str, request: Request):
     username = chat.get("username", "")
     text = biz_message.get("text", "")
 
+    # Если отправлен не текст (например фото/стикер), пропускаем отправку в Qwen Embedding
+    if not text or not text.strip():
+        print("ℹ️ Получено нетекстовое сообщение или пустой текст. Пропуск обработки.")
+        return JSONResponse({"ok": True})
+
     bot_row = supabase.table("bots").select("*").eq("id", bot_id).single().execute().data
     if not bot_row:
         return JSONResponse({"ok": True})
@@ -158,7 +163,6 @@ async def business_webhook(bot_id: str, request: Request):
     if (similarity > threshold and context) or is_greeting:
         print("✅ Условие пройдено! Генерация ответа через Qwen...")
         
-        # Если это приветствие и базы знаний нет, передаем подсказку для генерации
         effective_context = context if context else "Клиент поздоровался. Поздоровайся вежливо в ответ и спроси, чем можешь помочь."
         reply = qwen_client.generate_reply(system_prompt, effective_context, text)
         
