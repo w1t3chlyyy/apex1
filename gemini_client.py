@@ -20,7 +20,6 @@ def generate_reply(system_prompt: str, context: str, question: str) -> str:
     return response.text.strip()
 
 
-def embed_text(text: str) -> list[float]:
-    # ✅ БЕЗ f"models/"
+def embed_text(text: str) -> list[float]:  # ← УБРАТЬ ЛИШНЮЮ 'd'
     result = genai.embed_content(model=config.GEMINI_EMBEDDING_MODEL, content=text)
     return result["embedding"]
