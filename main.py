@@ -49,6 +49,8 @@ async def tg_call(token: str, method: str, payload: dict):
     url = TELEGRAM_API.format(token=token, method=method)
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(url, json=payload)
+        if resp.is_error:
+            print("Telegram Error Response:", resp.text)
         resp.raise_for_status()
         return resp.json()
 
@@ -146,8 +148,9 @@ async def business_webhook(bot_id: str, request: Request):
         }).execute()
     else:
         supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
-        PENDING_REPLIES.setdefault(owner_id, {})
-        await notify_owner(owner_id, username, text, conv["id"])
+        if owner_id:
+            PENDING_REPLIES.setdefault(owner_id, {})
+            await notify_owner(owner_id, username, text, conv["id"])
 
     return JSONResponse({"ok": True})
 
