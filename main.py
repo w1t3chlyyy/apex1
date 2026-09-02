@@ -6,6 +6,15 @@
 ОБНОВЛЕНО: вместо Gemini используется Qwen (Alibaba Cloud DashScope,
 OpenAI-совместимый режим) — см. qwen_client.py / config.py.
 
+ОБНОВЛЕНО (2): раньше бот отвечал ТОЛЬКО если вопрос клиента совпадал с
+базой знаний (similarity > threshold) или был точным приветствием — во
+всех остальных случаях диалог сразу уходил на оператора. Теперь бот
+отвечает на любой вопрос: если есть уверенное совпадение с базой знаний —
+отвечает строго по ней, если нет — отвечает на основе общих знаний и
+системного промпта (см. qwen_client.generate_reply). На оператора диалог
+переводится только если клиент сам явно об этом просит
+(см. config.ESCALATION_KEYWORDS).
+
 ВАЖНО: этот сервис обслуживает БОТОВ-АГЕНТОВ пользователей (bot_id из URL
 /webhook/business/{bot_id} соответствует строке в таблице `bots`, привязанной
 к owner_id пользователя личного кабинета). Он НЕ имеет отношения к сервисному
@@ -71,8 +80,8 @@ async def send_business_message(bot_token: str, business_connection_id: str, cha
 
 
 async def notify_owner(owner_telegram_id: int, customer_username: str, question: str, conversation_id: str):
-    """Пуш-уведомление владельцу с кнопкой «Ответить», когда ИИ не уверен в ответе."""
-    text = f"⚠️ ИИ не знает ответа на вопрос «{question}» от @{customer_username or 'unknown'}"
+    """Пуш-уведомление владельцу с кнопкой «Ответить», когда клиент явно просит оператора."""
+    text = f"👤 Клиент @{customer_username or 'unknown'} просит оператора: «{question}»"
     keyboard = {
         "inline_keyboard": [[
             {"text": "Ответить", "callback_data": f"reply:{conversation_id}"}
@@ -151,33 +160,46 @@ async def business_webhook(bot_id: str, request: Request):
             await notify_owner(owner_id, username, f"[Подписка истекла] {text}", conv["id"])
         return JSONResponse({"ok": True})
 
+    clean_text = text.strip().lower()
+    is_greeting = clean_text in GREETINGS
+    wants_human = any(kw in clean_text for kw in config.ESCALATION_KEYWORDS)
+
+    # Явный запрос оператора — эскалируем сразу, без обращения к RAG/Qwen.
+    if wants_human:
+        print(f"👤 Клиент явно просит оператора: '{text}'. Эскалация.")
+        supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
+        if owner_id:
+            await notify_owner(owner_id, username, text, conv["id"])
+        return JSONResponse({"ok": True})
+
     # Поиск контекста в базе знаний
     context, similarity = rag.search_knowledge_base(bot_id, text)
 
-    clean_text = text.strip().lower()
-    is_greeting = clean_text in GREETINGS
-
     print(f"🔍 [RAG DEBUG] Текст: '{text}' | Similarity: {similarity:.4f} | Threshold: {threshold:.4f} | Is Greeting: {is_greeting}")
 
-    # Отвечаем, если порог схожести пройден ИЛИ сообщение является простым приветствием
-    if (similarity > threshold and context) or is_greeting:
-        print("✅ Условие пройдено! Генерация ответа через Qwen...")
-        
-        effective_context = context if context else "Клиент поздоровался. Поздоровайся вежливо в ответ и спроси, чем можешь помочь."
-        reply = qwen_client.generate_reply(system_prompt, effective_context, text)
-        
-        print("📤 Отправка сообщения клиенту через Telegram Business...")
-        await send_business_message(bot_token, business_connection_id, chat_id, reply)
-        
-        supabase.table("messages").insert({
-            "conversation_id": conv["id"], "role": "assistant", "content": reply,
-        }).execute()
-    else:
-        print(f"❌ Схожесть {similarity:.4f} ниже порога {threshold:.4f}. Эскалация на человека.")
-        supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
-        if owner_id:
-            PENDING_REPLIES.setdefault(owner_id, {})
-            await notify_owner(owner_id, username, text, conv["id"])
+    # РАНЬШЕ: если совпадения с базой знаний не было (similarity <= threshold)
+    # и это не было точным приветствием — диалог СРАЗУ уходил на оператора,
+    # и бот вообще не пытался ответить. Из-за этого "как дела" и любой
+    # свободный вопрос игнорировались ботом.
+    #
+    # ТЕПЕРЬ: бот всегда пытается ответить через Qwen. Если есть уверенное
+    # совпадение с базой знаний — используем его как контекст (точный
+    # фактический ответ). Если нет — передаём пустой контекст, и
+    # qwen_client.generate_reply сформулирует общий вежливый ответ на
+    # основе роли бота, а не откажется отвечать.
+    has_confident_match = bool(context) and similarity > threshold
+    effective_context = context if has_confident_match else ""
+
+    print("✅ Генерация ответа через Qwen..." if has_confident_match else "ℹ️ Совпадений в базе нет — отвечаем через общие знания...")
+
+    reply = qwen_client.generate_reply(system_prompt, effective_context, text)
+
+    print("📤 Отправка сообщения клиенту через Telegram Business...")
+    await send_business_message(bot_token, business_connection_id, chat_id, reply)
+
+    supabase.table("messages").insert({
+        "conversation_id": conv["id"], "role": "assistant", "content": reply,
+    }).execute()
 
     return JSONResponse({"ok": True})
 
