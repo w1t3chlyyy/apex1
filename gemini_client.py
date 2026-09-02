@@ -21,5 +21,5 @@ def generate_reply(system_prompt: str, context: str, question: str) -> str:
 
 
 def embed_text(text: str) -> list[float]:
-    result = genai.embed_content(model=config.GEMINI_EMBEDDING_MODEL, content=text)
+    result = genai.embed_content(model=f"models/{config.GEMINI_EMBEDDING_MODEL}", content=text)
     return result["embedding"]
