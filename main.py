@@ -1,20 +1,17 @@
 """
 Сервисный Telegram-бот-агент: обработка вебхуков Telegram Business
-КОНКРЕТНОГО бота пользователя, RAG-ответы через Gemini, перехват диалогов
+КОНКРЕТНОГО бота пользователя, RAG-ответы через Qwen, перехват диалогов
 человеком.
+
+ОБНОВЛЕНО: вместо Gemini используется Qwen (Alibaba Cloud DashScope,
+OpenAI-совместимый режим) — см. qwen_client.py / config.py.
 
 ВАЖНО: этот сервис обслуживает БОТОВ-АГЕНТОВ пользователей (bot_id из URL
 /webhook/business/{bot_id} соответствует строке в таблице `bots`, привязанной
 к owner_id пользователя личного кабинета). Он НЕ имеет отношения к сервисному
-боту авторизации (TELEGRAM_SERVICE_BOT_TOKEN) — тот обслуживается в Next.js
-(app/api/bot/webhook/route.ts) и используется только для входа в кабинет и
-для уведомлений владельцу (notify_owner ниже).
-
-ИСПРАВЛЕНИЕ: раньше при первом сообщении клиента business_connection_id не
-сохранялся в таблицу conversations, из-за чего при передаче диалога человеку
-(service_webhook -> send_business_message) ответ владельца не мог быть
-отправлен клиенту (conv.get("business_connection_id") возвращал None).
-Теперь business_connection_id сохраняется в upsert ниже.
+боту авторизации/админ-панели (TELEGRAM_SERVICE_BOT_TOKEN) — тот обслуживается
+в Next.js (app/api/bot/webhook/route.ts) и используется для входа в кабинет,
+уведомлений владельцу (notify_owner ниже) и админ-панели (рассылки, тарифы).
 """
 
 import httpx
@@ -23,17 +20,11 @@ from fastapi.responses import JSONResponse
 
 import config
 import rag
-import gemini_client
+import qwen_client
 from supabase import create_client
 
 app = FastAPI(title="Telegram Service Bot")
 
-# Ленивая инициализация: раньше клиент создавался здесь же на уровне модуля,
-# из-за чего при отсутствии/неверных SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY
-# падал ИМПОРТ всего модуля (и, соответственно, весь процесс — даже /health
-# переставал отвечать). Теперь клиент создаётся при первом реальном
-# обращении, а при отсутствии ключей выбрасывается понятная ошибка вместо
-# крипто-трейса "Invalid API key" на старте.
 _supabase = None
 
 
@@ -54,10 +45,6 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 PENDING_REPLIES: dict[int, dict] = {}
 
 
-# ---------------------------------------------------------------------------
-# Вспомогательные функции Telegram API
-# ---------------------------------------------------------------------------
-
 async def tg_call(token: str, method: str, payload: dict):
     url = TELEGRAM_API.format(token=token, method=method)
     async with httpx.AsyncClient(timeout=15) as client:
@@ -76,14 +63,7 @@ async def send_business_message(bot_token: str, business_connection_id: str, cha
 
 
 async def notify_owner(owner_telegram_id: int, customer_username: str, question: str, conversation_id: str):
-    """Пуш-уведомление владельцу с кнопкой «Ответить», когда ИИ не уверен в ответе.
-
-    Уведомление шлётся через СЕРВИСНЫЙ бот авторизации (TELEGRAM_SERVICE_BOT_TOKEN),
-    т.к. владелец логинится в личный кабинет именно через него — это ожидаемо
-    и НЕ является той же ошибкой, что была с ботами-агентами: здесь как раз
-    нужен именно сервисный бот, чтобы у владельца был единый чат для всех
-    уведомлений от любого количества его агентов.
-    """
+    """Пуш-уведомление владельцу с кнопкой «Ответить», когда ИИ не уверен в ответе."""
     text = f"⚠️ ИИ не знает ответа на вопрос «{question}» от @{customer_username or 'unknown'}"
     keyboard = {
         "inline_keyboard": [[
@@ -96,10 +76,6 @@ async def notify_owner(owner_telegram_id: int, customer_username: str, question:
         "reply_markup": keyboard,
     })
 
-
-# ---------------------------------------------------------------------------
-# Вебхук от Telegram Business (сообщения клиентов конкретному боту-агенту)
-# ---------------------------------------------------------------------------
 
 @app.post("/webhook/business/{bot_id}")
 async def business_webhook(bot_id: str, request: Request):
@@ -125,9 +101,18 @@ async def business_webhook(bot_id: str, request: Request):
     system_prompt = bot_row.get("system_prompt") or "Ты — полезный ассистент поддержки клиентов."
     threshold = bot_row.get("confidence_threshold") or config.RAG_CONFIDENCE_THRESHOLD
 
-    # Сохраняем входящее сообщение. business_connection_id сохраняем ВСЕГДА
-    # (в т.ч. обновляем при каждом сообщении) — он нужен позже, чтобы
-    # владелец мог ответить клиенту через send_business_message.
+    # Если подписка владельца истекла — бот не отвечает автоматически, а
+    # сразу эскалирует диалог на владельца с пометкой об истёкшем тарифе.
+    subscription_expires_at = bot_row.get("subscription_expires_at")
+    subscription_active = True
+    if subscription_expires_at:
+        from datetime import datetime, timezone
+        try:
+            expires = datetime.fromisoformat(subscription_expires_at.replace("Z", "+00:00"))
+            subscription_active = expires > datetime.now(timezone.utc)
+        except ValueError:
+            subscription_active = True
+
     conv = supabase.table("conversations").upsert(
         {
             "bot_id": bot_id,
@@ -142,14 +127,19 @@ async def business_webhook(bot_id: str, request: Request):
         "conversation_id": conv["id"], "role": "customer", "content": text,
     }).execute()
 
-    # Если диалог уже перехвачен человеком — не отвечаем автоматически
     if conv.get("status") == "human_takeover":
+        return JSONResponse({"ok": True})
+
+    if not subscription_active:
+        supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
+        if owner_id:
+            await notify_owner(owner_id, username, f"[Подписка истекла] {text}", conv["id"])
         return JSONResponse({"ok": True})
 
     context, similarity = rag.search_knowledge_base(bot_id, text)
 
     if similarity > threshold and context:
-        reply = gemini_client.generate_reply(system_prompt, context, text)
+        reply = qwen_client.generate_reply(system_prompt, context, text)
         await send_business_message(bot_token, business_connection_id, chat_id, reply)
         supabase.table("messages").insert({
             "conversation_id": conv["id"], "role": "assistant", "content": reply,
@@ -162,30 +152,21 @@ async def business_webhook(bot_id: str, request: Request):
     return JSONResponse({"ok": True})
 
 
-# ---------------------------------------------------------------------------
-# ⚠️ НЕ РЕГИСТРИРОВАТЬ КАК WEBHOOK. Оставлено только для справки/локального
-# тестирования логики. У сервисного бота может быть только ОДИН webhook URL,
-# и это теперь app/api/bot/webhook/route.ts в Next.js — там реализована
-# ТА ЖЕ логика (обработка callback_query "reply:" и текста-ответа владельца),
-# см. handleOwnerCallback / handleOwnerReplyText в этом файле Next.js.
-# Если вы предпочитаете держать эту логику здесь (в Python), а не в Next.js —
-# удалите её дублирование из route.ts и зарегистрируйте вебхук сервисного
-# бота именно на этот роут вместо Next.js. Делать оба одновременно нельзя.
-# ---------------------------------------------------------------------------
-
+# ⚠️ НЕ РЕГИСТРИРОВАТЬ КАК WEBHOOK — см. пояснение в предыдущей версии файла.
+# Логика владелец-отвечает-клиенту и админ-панель теперь живут в Next.js
+# (app/api/bot/webhook/route.ts), т.к. у сервисного бота может быть только
+# один webhook URL.
 @app.post("/webhook/service")
 async def service_webhook(request: Request):
     supabase = get_supabase()
-
     update = await request.json()
 
-    # Нажатие кнопки "Ответить"
     callback = update.get("callback_query")
     if callback:
         data = callback["data"]
         owner_id = callback["from"]["id"]
         if data.startswith("reply:"):
-            conversation_id = data.split(":", 1)[1]
+            conversation_id = data[len("reply:"):]
             PENDING_REPLIES[owner_id] = {"conversation_id": conversation_id}
             await tg_call(config.TELEGRAM_SERVICE_BOT_TOKEN, "sendMessage", {
                 "chat_id": owner_id,
@@ -196,7 +177,6 @@ async def service_webhook(request: Request):
         })
         return JSONResponse({"ok": True})
 
-    # Текстовое сообщение владельца — если ожидается ответ клиенту, пересылаем его
     message = update.get("message")
     if message and "text" in message:
         owner_id = message["from"]["id"]
