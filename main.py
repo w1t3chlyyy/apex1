@@ -50,7 +50,7 @@ async def tg_call(token: str, method: str, payload: dict):
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(url, json=payload)
         if resp.is_error:
-            print("Telegram Error Response:", resp.text)
+            print(f"❌ Telegram API Error: {resp.status_code} — {resp.text}")
         resp.raise_for_status()
         return resp.json()
 
@@ -130,23 +130,34 @@ async def business_webhook(bot_id: str, request: Request):
     }).execute()
 
     if conv.get("status") == "human_takeover":
+        print(f"ℹ️ Диалог {conv['id']} находится под управлением человека (human_takeover). ИИ пропускает сообщение.")
         return JSONResponse({"ok": True})
 
     if not subscription_active:
+        print(f"⚠️ У владельца бота истекла подписка. Перевод диалога {conv['id']} на оператора.")
         supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
         if owner_id:
             await notify_owner(owner_id, username, f"[Подписка истекла] {text}", conv["id"])
         return JSONResponse({"ok": True})
 
+    # Поиск контекста в базе знаний
     context, similarity = rag.search_knowledge_base(bot_id, text)
 
+    # ЛОГИРОВАНИЕ ДЛЯ ДЕБАГА
+    print(f"🔍 [RAG DEBUG] Текст: '{text}' | Similarity: {similarity:.4f} | Threshold: {threshold:.4f} | Context found: {bool(context)}")
+
     if similarity > threshold and context:
+        print(f"✅ Схожесть пройдена! Генерация ответа через Qwen...")
         reply = qwen_client.generate_reply(system_prompt, context, text)
+        
+        print(f"📤 Отправка сообщения клиенту через Telegram Business...")
         await send_business_message(bot_token, business_connection_id, chat_id, reply)
+        
         supabase.table("messages").insert({
             "conversation_id": conv["id"], "role": "assistant", "content": reply,
         }).execute()
     else:
+        print(f"❌ Схожесть {similarity:.4f} ниже порога {threshold:.4f} или нет контекста. Эскалация на человека.")
         supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
         if owner_id:
             PENDING_REPLIES.setdefault(owner_id, {})
@@ -155,10 +166,7 @@ async def business_webhook(bot_id: str, request: Request):
     return JSONResponse({"ok": True})
 
 
-# ⚠️ НЕ РЕГИСТРИРОВАТЬ КАК WEBHOOK — см. пояснение в предыдущей версии файла.
-# Логика владелец-отвечает-клиенту и админ-панель теперь живут в Next.js
-# (app/api/bot/webhook/route.ts), т.к. у сервисного бота может быть только
-# один webhook URL.
+# ⚠️ НЕ РЕГИСТРИРОВАТЬ КАК WEBHOOK — логика живет в Next.js (app/api/bot/webhook/route.ts)
 @app.post("/webhook/service")
 async def service_webhook(request: Request):
     supabase = get_supabase()
