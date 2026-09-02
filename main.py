@@ -229,6 +229,7 @@ async def service_webhook(request: Request):
 @app.get("/health")
 @app.get("/debug/env")
 async def debug_env():
+    import supabase as supabase_pkg
     url = config.SUPABASE_URL
     key = config.SUPABASE_SERVICE_ROLE_KEY
     return {
@@ -237,6 +238,5 @@ async def debug_env():
         "service_key_set": bool(key),
         "service_key_length": len(key) if key else 0,
         "service_key_prefix": key[:12] + "..." if key else None,
+        "supabase_package_version": getattr(supabase_pkg, "__version__", "unknown"),
     }
-async def health():
-    return {"status": "ok"}
