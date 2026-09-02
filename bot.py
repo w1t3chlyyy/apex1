@@ -28,7 +28,25 @@ from supabase import create_client
 
 app = FastAPI(title="Telegram Service Bot")
 
-supabase = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
+# Ленивая инициализация: раньше клиент создавался здесь же на уровне модуля,
+# из-за чего при отсутствии/неверных SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY
+# падал ИМПОРТ всего модуля (и, соответственно, весь процесс — даже /health
+# переставал отвечать). Теперь клиент создаётся при первом реальном
+# обращении, а при отсутствии ключей выбрасывается понятная ошибка вместо
+# крипто-трейса "Invalid API key" на старте.
+_supabase = None
+
+
+def get_supabase():
+    global _supabase
+    if _supabase is None:
+        if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
+            raise RuntimeError(
+                "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY не заданы в переменных окружения"
+            )
+        _supabase = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
+    return _supabase
+
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 
@@ -85,6 +103,8 @@ async def notify_owner(owner_telegram_id: int, customer_username: str, question:
 
 @app.post("/webhook/business/{bot_id}")
 async def business_webhook(bot_id: str, request: Request):
+    supabase = get_supabase()
+
     update = await request.json()
     biz_message = update.get("business_message")
     if not biz_message:
@@ -155,6 +175,8 @@ async def business_webhook(bot_id: str, request: Request):
 
 @app.post("/webhook/service")
 async def service_webhook(request: Request):
+    supabase = get_supabase()
+
     update = await request.json()
 
     # Нажатие кнопки "Ответить"
