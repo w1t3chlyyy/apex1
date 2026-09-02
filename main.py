@@ -227,5 +227,16 @@ async def service_webhook(request: Request):
 
 
 @app.get("/health")
+@app.get("/debug/env")
+async def debug_env():
+    url = config.SUPABASE_URL
+    key = config.SUPABASE_SERVICE_ROLE_KEY
+    return {
+        "supabase_url_set": bool(url),
+        "supabase_url_preview": url[:20] + "..." if url else None,
+        "service_key_set": bool(key),
+        "service_key_length": len(key) if key else 0,
+        "service_key_prefix": key[:12] + "..." if key else None,
+    }
 async def health():
     return {"status": "ok"}
