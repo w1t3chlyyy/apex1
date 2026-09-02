@@ -20,7 +20,7 @@ def generate_reply(system_prompt: str, context: str, question: str) -> str:
     return response.text.strip()
 
 
-ddef embed_text(text: str) -> list[float]:
+def embed_text(text: str) -> list[float]:
     # ✅ БЕЗ f"models/"
     result = genai.embed_content(model=config.GEMINI_EMBEDDING_MODEL, content=text)
     return result["embedding"]
