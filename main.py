@@ -27,6 +27,12 @@ app = FastAPI(title="Telegram Service Bot")
 
 _supabase = None
 
+# Список стандартных слов-приветствий, на которые ИИ отвечает без проверки базы знаний
+GREETINGS = {
+    "привет", "здравствуйте", "добрый день", "добрый вечер", 
+    "доброе утро", "хай", "хеллоу", "hello", "hi", "салам"
+}
+
 
 def get_supabase():
     global _supabase
@@ -130,7 +136,7 @@ async def business_webhook(bot_id: str, request: Request):
     }).execute()
 
     if conv.get("status") == "human_takeover":
-        print(f"ℹ️ Диалог {conv['id']} находится под управлением человека (human_takeover). ИИ пропускает сообщение.")
+        print(f"ℹ️ Диалог {conv['id']} находится под управлением человека. ИИ пропускает сообщение.")
         return JSONResponse({"ok": True})
 
     if not subscription_active:
@@ -143,21 +149,27 @@ async def business_webhook(bot_id: str, request: Request):
     # Поиск контекста в базе знаний
     context, similarity = rag.search_knowledge_base(bot_id, text)
 
-    # ЛОГИРОВАНИЕ ДЛЯ ДЕБАГА
-    print(f"🔍 [RAG DEBUG] Текст: '{text}' | Similarity: {similarity:.4f} | Threshold: {threshold:.4f} | Context found: {bool(context)}")
+    clean_text = text.strip().lower()
+    is_greeting = clean_text in GREETINGS
 
-    if similarity > threshold and context:
-        print(f"✅ Схожесть пройдена! Генерация ответа через Qwen...")
-        reply = qwen_client.generate_reply(system_prompt, context, text)
+    print(f"🔍 [RAG DEBUG] Текст: '{text}' | Similarity: {similarity:.4f} | Threshold: {threshold:.4f} | Is Greeting: {is_greeting}")
+
+    # Отвечаем, если порог схожести пройден ИЛИ сообщение является простым приветствием
+    if (similarity > threshold and context) or is_greeting:
+        print("✅ Условие пройдено! Генерация ответа через Qwen...")
         
-        print(f"📤 Отправка сообщения клиенту через Telegram Business...")
+        # Если это приветствие и базы знаний нет, передаем подсказку для генерации
+        effective_context = context if context else "Клиент поздоровался. Поздоровайся вежливо в ответ и спроси, чем можешь помочь."
+        reply = qwen_client.generate_reply(system_prompt, effective_context, text)
+        
+        print("📤 Отправка сообщения клиенту через Telegram Business...")
         await send_business_message(bot_token, business_connection_id, chat_id, reply)
         
         supabase.table("messages").insert({
             "conversation_id": conv["id"], "role": "assistant", "content": reply,
         }).execute()
     else:
-        print(f"❌ Схожесть {similarity:.4f} ниже порога {threshold:.4f} или нет контекста. Эскалация на человека.")
+        print(f"❌ Схожесть {similarity:.4f} ниже порога {threshold:.4f}. Эскалация на человека.")
         supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
         if owner_id:
             PENDING_REPLIES.setdefault(owner_id, {})
@@ -166,7 +178,6 @@ async def business_webhook(bot_id: str, request: Request):
     return JSONResponse({"ok": True})
 
 
-# ⚠️ НЕ РЕГИСТРИРОВАТЬ КАК WEBHOOK — логика живет в Next.js (app/api/bot/webhook/route.ts)
 @app.post("/webhook/service")
 async def service_webhook(request: Request):
     supabase = get_supabase()
