@@ -1,6 +1,20 @@
 """
-Сервисный Telegram-бот: обработка вебхуков Telegram Business,
-RAG-ответы через Gemini, перехват диалогов человеком.
+Сервисный Telegram-бот-агент: обработка вебхуков Telegram Business
+КОНКРЕТНОГО бота пользователя, RAG-ответы через Gemini, перехват диалогов
+человеком.
+
+ВАЖНО: этот сервис обслуживает БОТОВ-АГЕНТОВ пользователей (bot_id из URL
+/webhook/business/{bot_id} соответствует строке в таблице `bots`, привязанной
+к owner_id пользователя личного кабинета). Он НЕ имеет отношения к сервисному
+боту авторизации (TELEGRAM_SERVICE_BOT_TOKEN) — тот обслуживается в Next.js
+(app/api/bot/webhook/route.ts) и используется только для входа в кабинет и
+для уведомлений владельцу (notify_owner ниже).
+
+ИСПРАВЛЕНИЕ: раньше при первом сообщении клиента business_connection_id не
+сохранялся в таблицу conversations, из-за чего при передаче диалога человеку
+(service_webhook -> send_business_message) ответ владельца не мог быть
+отправлен клиенту (conv.get("business_connection_id") возвращал None).
+Теперь business_connection_id сохраняется в upsert ниже.
 """
 
 import httpx
@@ -44,7 +58,14 @@ async def send_business_message(bot_token: str, business_connection_id: str, cha
 
 
 async def notify_owner(owner_telegram_id: int, customer_username: str, question: str, conversation_id: str):
-    """Пуш-уведомление владельцу с кнопкой «Ответить», когда ИИ не уверен в ответе."""
+    """Пуш-уведомление владельцу с кнопкой «Ответить», когда ИИ не уверен в ответе.
+
+    Уведомление шлётся через СЕРВИСНЫЙ бот авторизации (TELEGRAM_SERVICE_BOT_TOKEN),
+    т.к. владелец логинится в личный кабинет именно через него — это ожидаемо
+    и НЕ является той же ошибкой, что была с ботами-агентами: здесь как раз
+    нужен именно сервисный бот, чтобы у владельца был единый чат для всех
+    уведомлений от любого количества его агентов.
+    """
     text = f"⚠️ ИИ не знает ответа на вопрос «{question}» от @{customer_username or 'unknown'}"
     keyboard = {
         "inline_keyboard": [[
@@ -59,7 +80,7 @@ async def notify_owner(owner_telegram_id: int, customer_username: str, question:
 
 
 # ---------------------------------------------------------------------------
-# Вебхук от Telegram Business (сообщения клиентов конкретному боту)
+# Вебхук от Telegram Business (сообщения клиентов конкретному боту-агенту)
 # ---------------------------------------------------------------------------
 
 @app.post("/webhook/business/{bot_id}")
@@ -84,9 +105,16 @@ async def business_webhook(bot_id: str, request: Request):
     system_prompt = bot_row.get("system_prompt") or "Ты — полезный ассистент поддержки клиентов."
     threshold = bot_row.get("confidence_threshold") or config.RAG_CONFIDENCE_THRESHOLD
 
-    # Сохраняем входящее сообщение
+    # Сохраняем входящее сообщение. business_connection_id сохраняем ВСЕГДА
+    # (в т.ч. обновляем при каждом сообщении) — он нужен позже, чтобы
+    # владелец мог ответить клиенту через send_business_message.
     conv = supabase.table("conversations").upsert(
-        {"bot_id": bot_id, "customer_chat_id": chat_id, "customer_username": username},
+        {
+            "bot_id": bot_id,
+            "customer_chat_id": chat_id,
+            "customer_username": username,
+            "business_connection_id": business_connection_id,
+        },
         on_conflict="bot_id,customer_chat_id",
     ).execute().data[0]
 
@@ -115,7 +143,14 @@ async def business_webhook(bot_id: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Вебхук служебного бота (команды и ответы владельцев)
+# ⚠️ НЕ РЕГИСТРИРОВАТЬ КАК WEBHOOK. Оставлено только для справки/локального
+# тестирования логики. У сервисного бота может быть только ОДИН webhook URL,
+# и это теперь app/api/bot/webhook/route.ts в Next.js — там реализована
+# ТА ЖЕ логика (обработка callback_query "reply:" и текста-ответа владельца),
+# см. handleOwnerCallback / handleOwnerReplyText в этом файле Next.js.
+# Если вы предпочитаете держать эту логику здесь (в Python), а не в Next.js —
+# удалите её дублирование из route.ts и зарегистрируйте вебхук сервисного
+# бота именно на этот роут вместо Next.js. Делать оба одновременно нельзя.
 # ---------------------------------------------------------------------------
 
 @app.post("/webhook/service")
