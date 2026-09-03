@@ -15,7 +15,7 @@ def generate_reply(
     context: str,
     question: str,
     is_first_message: bool = True,
-) -> str:
+) -> tuple[str, int]:
     """
     Генерирует ответ клиенту.
 
@@ -38,6 +38,10 @@ def generate_reply(
     ничего больше. main.py дополнительно проверяет наличие этого слова в
     ответе как защиту на случай, если модель всё же добавит его в текст
     вместе с обычным ответом (см. main.py: is_escalation).
+
+    Возвращает (текст_ответа, total_tokens) — total_tokens нужен main.py,
+    чтобы вести учёт расхода бесплатного лимита токенов на бесплатном
+    тарифе (см. config.FREE_TIER_TOKEN_LIMIT).
     """
     context_block = f"Контекст из базы знаний компании:\n{context}\n\n" if context else ""
 
@@ -87,7 +91,9 @@ def generate_reply(
             {"role": "user", "content": prompt},
         ],
     )
-    return (response.choices[0].message.content or "").strip()
+    text = (response.choices[0].message.content or "").strip()
+    total_tokens = getattr(response.usage, "total_tokens", 0) if response.usage else 0
+    return text, total_tokens
 
 
 def embed_text(text: str) -> list[float]:
