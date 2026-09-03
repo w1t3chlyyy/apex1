@@ -6,6 +6,18 @@
 ОБНОВЛЕНО: вместо Gemini используется Qwen (Alibaba Cloud DashScope,
 OpenAI-совместимый режим) — см. qwen_client.py / config.py.
 
+ОБНОВЛЕНО (эскалация): раньше бот отвечал клиенту ТОЛЬКО если
+similarity (схожесть вопроса с базой знаний) была выше
+confidence_threshold — иначе диалог сразу уходил владельцу, даже на
+банальные бытовые вопросы вроде "привет" или "сколько время". Теперь
+бот всегда пытается ответить сам (см. qwen_client.generate_reply):
+использует контекст базы знаний, если он релевантен, а если нет —
+отвечает своими общими знаниями. Эскалация на человека решается самой
+моделью через спец-маркер ESCALATE в её ответе и происходит только в
+действительно исключительных случаях (явная просьба позвать
+человека, действия с аккаунтом/оплатой, жалоба, невозможность дать
+достоверный ответ).
+
 ВАЖНО: этот сервис обслуживает БОТОВ-АГЕНТОВ пользователей (bot_id из URL
 /webhook/business/{bot_id} соответствует строке в таблице `bots`, привязанной
 к owner_id пользователя личного кабинета). Он НЕ имеет отношения к сервисному
@@ -44,6 +56,11 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 # Простое in-memory состояние "владелец сейчас отвечает клиенту X" (для прод — использовать Redis)
 PENDING_REPLIES: dict[int, dict] = {}
 
+# Маркер, которым модель сигнализирует, что нужно передать диалог человеку
+# (см. qwen_client.generate_reply). Сравнение регистронезависимое и с
+# обрезкой пробелов/пунктуации на всякий случай.
+ESCALATE_MARKER = "ESCALATE"
+
 
 async def tg_call(token: str, method: str, payload: dict):
     url = TELEGRAM_API.format(token=token, method=method)
@@ -77,6 +94,18 @@ async def notify_owner(owner_telegram_id: int, customer_username: str, question:
     })
 
 
+def is_escalation(reply: str) -> bool:
+    """
+    Определяет, попросила ли модель передать диалог человеку.
+    Модель обучена (см. qwen_client.generate_reply) возвращать РОВНО слово
+    ESCALATE и ничего больше, но на всякий случай допускаем небольшую
+    вариативность (пробелы, регистр, конечная пунктуация), чтобы не
+    отправить клиенту служебное слово вместо нормального ответа.
+    """
+    cleaned = reply.strip().strip(".!?\"'").upper()
+    return cleaned == ESCALATE_MARKER
+
+
 @app.post("/webhook/business/{bot_id}")
 async def business_webhook(bot_id: str, request: Request):
     supabase = get_supabase()
@@ -107,7 +136,12 @@ async def business_webhook(bot_id: str, request: Request):
     bot_token = bot_row["bot_api_token"]
     owner_id = bot_row["owner_telegram_id"]
     system_prompt = bot_row.get("system_prompt") or "Ты — полезный ассистент поддержки клиентов."
-    threshold = bot_row.get("confidence_threshold") or config.RAG_CONFIDENCE_THRESHOLD
+
+    # ПРИМЕЧАНИЕ: confidence_threshold (bot_row.get("confidence_threshold") /
+    # config.RAG_CONFIDENCE_THRESHOLD) больше не используется для решения об
+    # эскалации — эскалация теперь определяется моделью (см. is_escalation
+    # выше и qwen_client.generate_reply). Поле оставлено в схеме/настройках
+    # для обратной совместимости, но на поведение бота не влияет.
 
     # Если подписка владельца истекла — бот не отвечает автоматически, а
     # сразу эскалирует диалог на владельца с пометкой об истёкшем тарифе.
@@ -155,16 +189,26 @@ async def business_webhook(bot_id: str, request: Request):
 
     context, similarity = rag.search_knowledge_base(bot_id, text)
 
-    if similarity > threshold and context:
-        reply = qwen_client.generate_reply(system_prompt, context, text)
+    # ИЗМЕНЕНО: раньше здесь была жёсткая развилка
+    #   if similarity > threshold and context: отвечаем по базе
+    #   else: сразу эскалируем на владельца
+    # из-за чего любой бытовой вопрос вне базы знаний уходил человеку.
+    # Теперь бот всегда пытается ответить сам — используя контекст базы
+    # знаний как приоритетный источник фактов, а при его отсутствии/
+    # нерелевантности отвечая общими знаниями. Эскалация происходит только
+    # если сама модель вернула служебный маркер ESCALATE (см. is_escalation
+    # и qwen_client.generate_reply).
+    reply = qwen_client.generate_reply(system_prompt, context, text)
+
+    if is_escalation(reply):
+        supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
+        PENDING_REPLIES.setdefault(owner_id, {})
+        await notify_owner(owner_id, username, text, conv["id"])
+    else:
         await send_business_message(bot_token, business_connection_id, chat_id, reply)
         supabase.table("messages").insert({
             "conversation_id": conv["id"], "role": "assistant", "content": reply,
         }).execute()
-    else:
-        supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
-        PENDING_REPLIES.setdefault(owner_id, {})
-        await notify_owner(owner_id, username, text, conv["id"])
 
     return JSONResponse({"ok": True})
 
