@@ -90,7 +90,15 @@ async def business_webhook(bot_id: str, request: Request):
     chat = biz_message["chat"]
     chat_id = chat["id"]
     username = chat.get("username", "")
-    text = biz_message.get("text", "")
+    text = (biz_message.get("text") or "").strip()
+
+    # Клиент мог прислать стикер/фото/голосовое/видео без текста — Telegram
+    # в таком случае не кладёт поле "text" вовсе. Раньше пустая строка
+    # улетала прямиком в Qwen embeddings и роняла весь запрос 500-й ошибкой
+    # ("input.texts should not be null"). Теперь для отображения владельцу
+    # и логов используем понятную подпись, а в RAG/эмбеддинги пустой текст
+    # вообще не отправляется (см. rag.py: search_knowledge_base).
+    display_text = text if text else "[не-текстовое сообщение: фото/стикер/голосовое/видео и т.п.]"
 
     bot_row = supabase.table("bots").select("*").eq("id", bot_id).single().execute().data
     if not bot_row:
@@ -124,7 +132,7 @@ async def business_webhook(bot_id: str, request: Request):
     ).execute().data[0]
 
     supabase.table("messages").insert({
-        "conversation_id": conv["id"], "role": "customer", "content": text,
+        "conversation_id": conv["id"], "role": "customer", "content": display_text,
     }).execute()
 
     if conv.get("status") == "human_takeover":
@@ -133,7 +141,16 @@ async def business_webhook(bot_id: str, request: Request):
     if not subscription_active:
         supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
         if owner_id:
-            await notify_owner(owner_id, username, f"[Подписка истекла] {text}", conv["id"])
+            await notify_owner(owner_id, username, f"[Подписка истекла] {display_text}", conv["id"])
+        return JSONResponse({"ok": True})
+
+    # Не-текстовые сообщения сразу эскалируем на владельца — ИИ по ним
+    # ничего не найдёт в базе знаний (search_knowledge_base вернёт "" при
+    # пустом тексте), поэтому нет смысла лишний раз дёргать Qwen/RAG.
+    if not text:
+        supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
+        if owner_id:
+            await notify_owner(owner_id, username, display_text, conv["id"])
         return JSONResponse({"ok": True})
 
     context, similarity = rag.search_knowledge_base(bot_id, text)
