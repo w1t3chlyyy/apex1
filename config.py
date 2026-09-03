@@ -17,3 +17,11 @@ TELEGRAM_SERVICE_BOT_TOKEN = os.getenv("TELEGRAM_SERVICE_BOT_TOKEN", "")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 
 RAG_CONFIDENCE_THRESHOLD = float(os.getenv("RAG_CONFIDENCE_THRESHOLD", "0.75"))
+
+# --- Лимит бесплатного тарифа ---
+# Сколько токенов ответа ИИ (только генерация ответа, без учёта эмбеддингов)
+# доступно бесплатно владельцу, который НИ РАЗУ не оформлял платный тариф
+# (bots.plan_id IS NULL). После исчерпания бот перестаёт отвечать клиентам
+# автоматически и владельцу приходит уведомление в сервисный бот с
+# предложением перейти на платный тариф (см. main.py: notify_owner_limit_reached).
+FREE_TIER_TOKEN_LIMIT = int(os.getenv("FREE_TIER_TOKEN_LIMIT", "15000"))
