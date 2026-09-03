@@ -26,6 +26,15 @@ def search_knowledge_base(bot_id: str, question: str, match_count: int = 3):
     Возвращает (context_text, best_similarity) — конкатенированный контекст
     и максимальную схожесть среди найденных фрагментов.
     """
+    # ВАЖНО: Qwen embeddings API падает с 400 "input.texts should not be null",
+    # если передать пустую строку (например, клиент прислал стикер/фото/голосовое
+    # без текста — biz_message.get("text", "") тогда возвращает ""). Раньше это
+    # роняло весь webhook с 500-й ошибкой. Теперь просто считаем, что контекст
+    # не найден, не дергая Qwen вообще.
+    question = (question or "").strip()
+    if not question:
+        return "", 0.0
+
     supabase = get_supabase()
     embedding = qwen_client.embed_text(question)
 
