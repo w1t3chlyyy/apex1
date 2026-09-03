@@ -6,15 +6,6 @@
 ОБНОВЛЕНО: вместо Gemini используется Qwen (Alibaba Cloud DashScope,
 OpenAI-совместимый режим) — см. qwen_client.py / config.py.
 
-ОБНОВЛЕНО (2): раньше бот отвечал ТОЛЬКО если вопрос клиента совпадал с
-базой знаний (similarity > threshold) или был точным приветствием — во
-всех остальных случаях диалог сразу уходил на оператора. Теперь бот
-отвечает на любой вопрос: если есть уверенное совпадение с базой знаний —
-отвечает строго по ней, если нет — отвечает на основе общих знаний и
-системного промпта (см. qwen_client.generate_reply). На оператора диалог
-переводится только если клиент сам явно об этом просит
-(см. config.ESCALATION_KEYWORDS).
-
 ВАЖНО: этот сервис обслуживает БОТОВ-АГЕНТОВ пользователей (bot_id из URL
 /webhook/business/{bot_id} соответствует строке в таблице `bots`, привязанной
 к owner_id пользователя личного кабинета). Он НЕ имеет отношения к сервисному
@@ -35,12 +26,6 @@ from supabase import create_client
 app = FastAPI(title="Telegram Service Bot")
 
 _supabase = None
-
-# Список стандартных слов-приветствий, на которые ИИ отвечает без проверки базы знаний
-GREETINGS = {
-    "привет", "здравствуйте", "добрый день", "добрый вечер", 
-    "доброе утро", "хай", "хеллоу", "hello", "hi", "салам"
-}
 
 
 def get_supabase():
@@ -64,8 +49,6 @@ async def tg_call(token: str, method: str, payload: dict):
     url = TELEGRAM_API.format(token=token, method=method)
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(url, json=payload)
-        if resp.is_error:
-            print(f"❌ Telegram API Error: {resp.status_code} — {resp.text}")
         resp.raise_for_status()
         return resp.json()
 
@@ -80,8 +63,8 @@ async def send_business_message(bot_token: str, business_connection_id: str, cha
 
 
 async def notify_owner(owner_telegram_id: int, customer_username: str, question: str, conversation_id: str):
-    """Пуш-уведомление владельцу с кнопкой «Ответить», когда клиент явно просит оператора."""
-    text = f"👤 Клиент @{customer_username or 'unknown'} просит оператора: «{question}»"
+    """Пуш-уведомление владельцу с кнопкой «Ответить», когда ИИ не уверен в ответе."""
+    text = f"⚠️ ИИ не знает ответа на вопрос «{question}» от @{customer_username or 'unknown'}"
     keyboard = {
         "inline_keyboard": [[
             {"text": "Ответить", "callback_data": f"reply:{conversation_id}"}
@@ -108,11 +91,6 @@ async def business_webhook(bot_id: str, request: Request):
     chat_id = chat["id"]
     username = chat.get("username", "")
     text = biz_message.get("text", "")
-
-    # Если отправлен не текст (например фото/стикер), пропускаем отправку в Qwen Embedding
-    if not text or not text.strip():
-        print("ℹ️ Получено нетекстовое сообщение или пустой текст. Пропуск обработки.")
-        return JSONResponse({"ok": True})
 
     bot_row = supabase.table("bots").select("*").eq("id", bot_id).single().execute().data
     if not bot_row:
@@ -150,60 +128,34 @@ async def business_webhook(bot_id: str, request: Request):
     }).execute()
 
     if conv.get("status") == "human_takeover":
-        print(f"ℹ️ Диалог {conv['id']} находится под управлением человека. ИИ пропускает сообщение.")
         return JSONResponse({"ok": True})
 
     if not subscription_active:
-        print(f"⚠️ У владельца бота истекла подписка. Перевод диалога {conv['id']} на оператора.")
         supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
         if owner_id:
             await notify_owner(owner_id, username, f"[Подписка истекла] {text}", conv["id"])
         return JSONResponse({"ok": True})
 
-    clean_text = text.strip().lower()
-    is_greeting = clean_text in GREETINGS
-    wants_human = any(kw in clean_text for kw in config.ESCALATION_KEYWORDS)
-
-    # Явный запрос оператора — эскалируем сразу, без обращения к RAG/Qwen.
-    if wants_human:
-        print(f"👤 Клиент явно просит оператора: '{text}'. Эскалация.")
-        supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
-        if owner_id:
-            await notify_owner(owner_id, username, text, conv["id"])
-        return JSONResponse({"ok": True})
-
-    # Поиск контекста в базе знаний
     context, similarity = rag.search_knowledge_base(bot_id, text)
 
-    print(f"🔍 [RAG DEBUG] Текст: '{text}' | Similarity: {similarity:.4f} | Threshold: {threshold:.4f} | Is Greeting: {is_greeting}")
-
-    # РАНЬШЕ: если совпадения с базой знаний не было (similarity <= threshold)
-    # и это не было точным приветствием — диалог СРАЗУ уходил на оператора,
-    # и бот вообще не пытался ответить. Из-за этого "как дела" и любой
-    # свободный вопрос игнорировались ботом.
-    #
-    # ТЕПЕРЬ: бот всегда пытается ответить через Qwen. Если есть уверенное
-    # совпадение с базой знаний — используем его как контекст (точный
-    # фактический ответ). Если нет — передаём пустой контекст, и
-    # qwen_client.generate_reply сформулирует общий вежливый ответ на
-    # основе роли бота, а не откажется отвечать.
-    has_confident_match = bool(context) and similarity > threshold
-    effective_context = context if has_confident_match else ""
-
-    print("✅ Генерация ответа через Qwen..." if has_confident_match else "ℹ️ Совпадений в базе нет — отвечаем через общие знания...")
-
-    reply = qwen_client.generate_reply(system_prompt, effective_context, text)
-
-    print("📤 Отправка сообщения клиенту через Telegram Business...")
-    await send_business_message(bot_token, business_connection_id, chat_id, reply)
-
-    supabase.table("messages").insert({
-        "conversation_id": conv["id"], "role": "assistant", "content": reply,
-    }).execute()
+    if similarity > threshold and context:
+        reply = qwen_client.generate_reply(system_prompt, context, text)
+        await send_business_message(bot_token, business_connection_id, chat_id, reply)
+        supabase.table("messages").insert({
+            "conversation_id": conv["id"], "role": "assistant", "content": reply,
+        }).execute()
+    else:
+        supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
+        PENDING_REPLIES.setdefault(owner_id, {})
+        await notify_owner(owner_id, username, text, conv["id"])
 
     return JSONResponse({"ok": True})
 
 
+# ⚠️ НЕ РЕГИСТРИРОВАТЬ КАК WEBHOOK — см. пояснение в предыдущей версии файла.
+# Логика владелец-отвечает-клиенту и админ-панель теперь живут в Next.js
+# (app/api/bot/webhook/route.ts), т.к. у сервисного бота может быть только
+# один webhook URL.
 @app.post("/webhook/service")
 async def service_webhook(request: Request):
     supabase = get_supabase()
