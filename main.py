@@ -1,68 +1,28 @@
 """
-Сервисный Telegram-бот-агент: обработка вебхуков Telegram Business
-КОНКРЕТНОГО бота пользователя, RAG-ответы через Qwen, перехват диалогов
-человеком.
+Telegram-бот-агент: вебхуки Telegram Business бота КОНКРЕТНОГО пользователя,
+RAG-ответы через Qwen, эскалация на человека.
 
-ОБНОВЛЕНО: вместо Gemini используется Qwen (Alibaba Cloud DashScope,
-OpenAI-совместимый режим) — см. qwen_client.py / config.py.
+Правила работы:
+- Вебхук принимает только запросы с верным X-Telegram-Bot-Api-Secret-Token.
+- Бот всегда пытается ответить сам; эскалация — маркер ESCALATE от модели.
+- Подписка истекла -> бот молчит, диалог уходит владельцу.
+- Бесплатный тариф (нет plan_id): лимит токенов FREE_TIER_TOKEN_LIMIT.
+- Платный тариф: лимит «ответов ИИ» за 30 дней из plans.messages_limit.
+- Сообщения самого владельца клиенту только логируются.
+- human_takeover снимается через HUMAN_TAKEOVER_HOURS после ответа владельца.
 
-ОБНОВЛЕНО (эскалация): бот всегда пытается ответить сам (используя контекст
-базы знаний, если он релевантен, иначе — общие знания), а эскалация на
-человека решается моделью через маркер ESCALATE в её ответе (см.
-qwen_client.generate_reply) и происходит только в исключительных случаях.
-
-ОБНОВЛЕНО (защита от утечки маркера): раньше эскалация определялась строгим
-сравнением reply == "ESCALATE", и если модель добавляла к маркеру хоть
-что-то ещё (например "Хорошо, ESCALATE" или обычный ответ с этим словом
-внутри) — сравнение не срабатывало, и клиент видел слово ESCALATE прямо в
-чате. Теперь is_escalation() ищет маркер ESCALATE как отдельное слово в
-ЛЮБОМ месте ответа: если он найден — диалог эскалируется, а сырой текст с
-маркером клиенту никогда не отправляется.
-
-ОБНОВЛЕНО (приветствие): раньше бот здоровался в каждом ответе, т.к. каждый
-вызов модели не знал, было ли уже приветствие в этом диалоге. Теперь перед
-вызовом qwen_client.generate_reply() проверяется, есть ли в диалоге уже
-хотя бы одно сообщение от ассистента — если да, модели явно запрещается
-здороваться повторно (см. is_first_message ниже и qwen_client.py).
-
-ОБНОВЛЕНО (не отвечать на сообщения владельца): Telegram Business пересылает
-боту ОБА направления переписки — и сообщения клиента, и сообщения, которые
-сам владелец бизнес-аккаунта написал клиенту вручную через свой личный
-Telegram (у поля "chat" в обоих случаях один и тот же customer chat_id,
-поэтому раньше бот не мог их различить и пытался сгенерировать AI-ответ
-даже на СВОИ ЖЕ сообщения владельца). Теперь business_webhook сравнивает
-`from.id` отправителя сообщения с `owner_telegram_id` бота: если это сам
-владелец — ИИ не отвечает, сообщение просто логируется в историю диалога
-с ролью "owner" (см. is_from_owner ниже).
-
-ОБНОВЛЕНО (лимит бесплатного тарифа): раньше бот без ОФОРМЛЕННОГО тарифа
-(bots.plan_id IS NULL, subscription_expires_at IS NULL) считался
-"активным" по умолчанию (subscription_active = True) и отвечал клиентам
-БЕЗ ОГРАНИЧЕНИЙ — это и есть причина того, что запустить бота и жечь
-токены Qwen мог кто угодно бесплатно. Теперь для таких ботов ведётся учёт
-потраченных токенов (bots.free_tokens_used) и после достижения
-config.FREE_TIER_TOKEN_LIMIT (по умолчанию 1000) бот перестаёт отвечать
-клиентам автоматически, диалог переводится в статус "awaiting_human", а
-владельцу приходит сообщение в СЕРВИСНЫЙ бот с предложением оформить
-платный тариф (см. notify_owner_limit_reached). Как только владелец
-оформляет любой тариф (bots.plan_id становится не NULL), проверка
-бесплатного лимита больше не применяется — дальше действует обычная логика
-истечения платной подписки (см. блок `if not subscription_active`).
-
-ВАЖНО: этот сервис обслуживает БОТОВ-АГЕНТОВ пользователей (bot_id из URL
-/webhook/business/{bot_id} соответствует строке в таблице `bots`, привязанной
-к owner_id пользователя личного кабинета). Он НЕ имеет отношения к сервисному
-боту авторизации/админ-панели (TELEGRAM_SERVICE_BOT_TOKEN) — тот обслуживается
-в Next.js (app/api/bot/webhook/route.ts) и используется для входа в кабинет,
-уведомлений владельцу (notify_owner/notify_owner_limit_reached ниже) и
-админ-панели (рассылки, тарифы).
+Служебный бот (вход, ответ владельца, админ-панель) обслуживается в Next.js
+(app/api/bot/webhook/route.ts); здесь он только отправляет уведомления.
 """
 
+import hmac
 import re
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 import config
 import rag
@@ -78,24 +38,36 @@ def get_supabase():
     global _supabase
     if _supabase is None:
         if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
-            raise RuntimeError(
-                "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY не заданы в переменных окружения"
-            )
+            raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY не заданы")
         _supabase = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
     return _supabase
 
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+USAGE_WINDOW = timedelta(days=30)
 
-# Простое in-memory состояние "владелец сейчас отвечает клиенту X" (для прод — использовать Redis)
-PENDING_REPLIES: dict[int, dict] = {}
-
-# Маркер, которым модель сигнализирует, что нужно передать диалог человеку
-# (см. qwen_client.generate_reply). Ищем как отдельное слово в любом месте
-# ответа (не строгое равенство!) — это защищает от ситуации, когда модель
-# не идеально следует инструкции и добавляет к маркеру лишний текст: такой
-# ответ ВСЁ РАВНО будет распознан как эскалация и никогда не уйдёт клиенту.
+# Маркер эскалации ищем как отдельное слово в любом месте ответа: даже если
+# модель добавит лишний текст, клиенту он не уйдёт.
 ESCALATE_PATTERN = re.compile(r"\bESCALATE\b", re.IGNORECASE)
+
+HEADER_UNKNOWN = "⚠️ ИИ не знает ответа на вопрос"
+HEADER_EXPIRED = "⏳ Подписка истекла, ИИ не отвечает. Вопрос клиента:"
+HEADER_LIMIT = "📉 Лимит ответов ИИ по тарифу исчерпан, ИИ не отвечает. Вопрос клиента:"
+HEADER_ERROR = "⚠️ Не удалось получить ответ ИИ. Вопрос клиента:"
+
+
+def is_escalation(reply: str) -> bool:
+    return bool(ESCALATE_PATTERN.search(reply))
+
+
+def parse_dt(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 async def tg_call(token: str, method: str, payload: dict):
@@ -107,7 +79,6 @@ async def tg_call(token: str, method: str, payload: dict):
 
 
 async def send_business_message(bot_token: str, business_connection_id: str, chat_id: int, text: str):
-    """Отправляет сообщение от лица подключённого Telegram Business аккаунта."""
     return await tg_call(bot_token, "sendMessage", {
         "business_connection_id": business_connection_id,
         "chat_id": chat_id,
@@ -115,53 +86,99 @@ async def send_business_message(bot_token: str, business_connection_id: str, cha
     })
 
 
-async def notify_owner(owner_telegram_id: int, customer_username: str, question: str, conversation_id: str):
-    """Пуш-уведомление владельцу с кнопкой «Ответить», когда ИИ не уверен в ответе."""
-    text = f"⚠️ ИИ не знает ответа на вопрос «{question}» от @{customer_username or 'unknown'}"
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "Ответить", "callback_data": f"reply:{conversation_id}"}
-        ]]
-    }
-    await tg_call(config.TELEGRAM_SERVICE_BOT_TOKEN, "sendMessage", {
-        "chat_id": owner_telegram_id,
-        "text": text,
-        "reply_markup": keyboard,
-    })
+async def notify_owner(owner_telegram_id, customer_username, question, conversation_id, header=HEADER_UNKNOWN):
+    """Пуш владельцу с кнопкой «Ответить». Ошибки Telegram не должны ронять вебхук."""
+    if not owner_telegram_id:
+        return
+    text = f"{header} «{question}» от @{customer_username or 'unknown'}"
+    keyboard = {"inline_keyboard": [[{"text": "Ответить", "callback_data": f"reply:{conversation_id}"}]]}
+    try:
+        await tg_call(config.TELEGRAM_SERVICE_BOT_TOKEN, "sendMessage", {
+            "chat_id": owner_telegram_id,
+            "text": text,
+            "reply_markup": keyboard,
+        })
+    except Exception as exc:
+        print(f"[notify_owner] не удалось отправить уведомление: {exc}")
 
 
-async def notify_owner_limit_reached(owner_telegram_id: int, token_limit: int):
-    """
-    Уведомляет владельца о том, что бесплатный лимит токенов исчерпан, и
-    предлагает перейти на платный тариф. Отправляется один раз при
-    достижении лимита (main.py не шлёт это повторно на каждое следующее
-    сообщение клиента — см. already_awaiting в business_webhook).
-    """
+async def notify_owner_limit_reached(owner_telegram_id, token_limit: int):
+    if not owner_telegram_id:
+        return
     text = (
         f"🚫 Бесплатный лимит в {token_limit} токенов ответов ИИ исчерпан.\n\n"
         "Ваш AI-ассистент больше не отвечает клиентам автоматически — "
         "диалоги теперь нужно вести вручную. Чтобы бот снова заработал, "
         "оформите платный тариф в личном кабинете → раздел «Подписка»."
     )
-    await tg_call(config.TELEGRAM_SERVICE_BOT_TOKEN, "sendMessage", {
-        "chat_id": owner_telegram_id,
-        "text": text,
-    })
+    try:
+        await tg_call(config.TELEGRAM_SERVICE_BOT_TOKEN, "sendMessage", {
+            "chat_id": owner_telegram_id,
+            "text": text,
+        })
+    except Exception as exc:
+        print(f"[notify_owner_limit_reached] не удалось отправить уведомление: {exc}")
 
 
-def is_escalation(reply: str) -> bool:
-    """
-    Определяет, попросила ли модель передать диалог человеку. Намеренно НЕ
-    сравнивает строку целиком (reply == "ESCALATE"), а ищет маркер как
-    отдельное слово где угодно в ответе — иначе при малейшем отклонении
-    модели от формата (лишний текст рядом с маркером) слово ESCALATE
-    утекало бы прямо в чат клиенту вместо того, чтобы вызвать эскалацию.
-    """
-    return bool(ESCALATE_PATTERN.search(reply))
+def get_usage(bot_row):
+    """(использовано ответов, начало окна). Окно 30 дней; по истечении обнуляется."""
+    now = datetime.now(timezone.utc)
+    start = parse_dt(bot_row.get("ai_replies_period_start"))
+    if start is None or now - start >= USAGE_WINDOW:
+        return 0, now
+    return int(bot_row.get("ai_replies_used") or 0), start
+
+
+def get_plan_messages_limit(supabase, plan_id):
+    """Лимит ответов за 30 дней. None = без лимита."""
+    try:
+        rows = supabase.table("plans").select("messages_limit").eq("id", plan_id).limit(1).execute().data
+    except Exception as exc:
+        print(f"[plans] не удалось прочитать тариф {plan_id}: {exc}")
+        rows = None
+    if rows:
+        return rows[0].get("messages_limit")
+    return config.DEFAULT_PLAN_MESSAGE_LIMITS.get(plan_id)
+
+
+def takeover_expired(supabase, conversation_id) -> bool:
+    """Диалог в human_takeover: прошло ли HUMAN_TAKEOVER_HOURS с ответа владельца."""
+    if config.HUMAN_TAKEOVER_HOURS <= 0:
+        return False
+    rows = (
+        supabase.table("messages")
+        .select("created_at")
+        .eq("conversation_id", conversation_id)
+        .eq("role", "owner")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    last = parse_dt(rows[0]["created_at"]) if rows else None
+    if last is None:
+        return True
+    return datetime.now(timezone.utc) - last >= timedelta(hours=config.HUMAN_TAKEOVER_HOURS)
+
+
+def set_status(supabase, conversation_id, status):
+    supabase.table("conversations").update({"status": status}).eq("id", conversation_id).execute()
+
+
+def webhook_secret_ok(request: Request) -> bool:
+    expected = config.TELEGRAM_WEBHOOK_SECRET
+    if not expected:
+        print("[webhook] TELEGRAM_WEBHOOK_SECRET не задан — запросы отклоняются")
+        return False
+    got = request.headers.get("x-telegram-bot-api-secret-token", "")
+    return hmac.compare_digest(got, expected)
 
 
 @app.post("/webhook/business/{bot_id}")
 async def business_webhook(bot_id: str, request: Request):
+    if not webhook_secret_ok(request):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
     supabase = get_supabase()
 
     update = await request.json()
@@ -174,53 +191,31 @@ async def business_webhook(bot_id: str, request: Request):
     chat_id = chat["id"]
     username = chat.get("username", "")
     text = (biz_message.get("text") or "").strip()
-
-    # Клиент мог прислать стикер/фото/голосовое/видео без текста — Telegram
-    # в таком случае не кладёт поле "text" вовсе. Раньше пустая строка
-    # улетала прямиком в Qwen embeddings и роняла весь запрос 500-й ошибкой
-    # ("input.texts should not be null"). Теперь для отображения владельцу
-    # и логов используем понятную подпись, а в RAG/эмбеддинги пустой текст
-    # вообще не отправляется (см. rag.py: search_knowledge_base).
     display_text = text if text else "[не-текстовое сообщение: фото/стикер/голосовое/видео и т.п.]"
 
-    bot_row = supabase.table("bots").select("*").eq("id", bot_id).single().execute().data
-    if not bot_row:
+    rows = supabase.table("bots").select("*").eq("id", bot_id).limit(1).execute().data
+    if not rows:
         return JSONResponse({"ok": True})
+    bot_row = rows[0]
 
-    bot_token = bot_row["bot_api_token"]
-    owner_id = bot_row["owner_telegram_id"]
+    bot_token = bot_row.get("bot_api_token")
+    if not bot_token:
+        return JSONResponse({"ok": True})
+    owner_id = bot_row.get("owner_telegram_id")
     system_prompt = bot_row.get("system_prompt") or "Ты — полезный ассистент поддержки клиентов."
 
-    # ПРИМЕЧАНИЕ: confidence_threshold больше не используется для решения об
-    # эскалации — эскалация теперь определяется моделью (см. is_escalation
-    # выше и qwen_client.generate_reply). Поле оставлено в схеме/настройках
-    # для обратной совместимости, но на поведение бота не влияет.
-
-    # Если подписка владельца истекла — бот не отвечает автоматически, а
-    # сразу эскалирует диалог на владельца с пометкой об истёкшем тарифе.
-    subscription_expires_at = bot_row.get("subscription_expires_at")
+    # Подписка: истёкшая платная -> бот не отвечает.
     subscription_active = True
-    if subscription_expires_at:
-        from datetime import datetime, timezone
-        try:
-            expires = datetime.fromisoformat(subscription_expires_at.replace("Z", "+00:00"))
-            subscription_active = expires > datetime.now(timezone.utc)
-        except ValueError:
-            subscription_active = True
+    expires = parse_dt(bot_row.get("subscription_expires_at"))
+    if expires is not None:
+        subscription_active = expires > datetime.now(timezone.utc)
 
-    # Бесплатный тариф: владелец ни разу не оформлял платный план
-    # (plan_id IS NULL). Раньше именно такие боты работали без каких-либо
-    # ограничений — subscription_active по умолчанию True, потому что
-    # subscription_expires_at тоже был NULL и проверка выше её пропускала.
     plan_id = bot_row.get("plan_id")
     free_tokens_used = bot_row.get("free_tokens_used") or 0
     is_free_tier = not plan_id
 
-    # Отличаем "клиент написал боту" от "владелец сам написал клиенту вручную
-    # через свой личный Telegram". У обоих сообщений одинаковый chat_id (это
-    # один и тот же чат владелец-клиент), поэтому смотрим именно на автора.
-    sender = biz_message.get("from") or {}
-    sender_id = sender.get("id")
+    # Автор сообщения: владелец (написал клиенту вручную) или клиент.
+    sender_id = (biz_message.get("from") or {}).get("id")
     is_from_owner = bool(owner_id) and sender_id == owner_id
 
     conv = supabase.table("conversations").upsert(
@@ -234,9 +229,6 @@ async def business_webhook(bot_id: str, request: Request):
     ).execute().data[0]
 
     if is_from_owner:
-        # Это сообщение самого владельца клиенту (написано вручную с его
-        # телефона/Telegram, а не через личный кабинет). ИИ на такие
-        # сообщения отвечать не должен — просто сохраняем в историю диалога.
         supabase.table("messages").insert({
             "conversation_id": conv["id"], "role": "owner", "content": display_text,
         }).execute()
@@ -247,38 +239,41 @@ async def business_webhook(bot_id: str, request: Request):
     }).execute()
 
     if conv.get("status") == "human_takeover":
-        return JSONResponse({"ok": True})
+        if not takeover_expired(supabase, conv["id"]):
+            return JSONResponse({"ok": True})
+        set_status(supabase, conv["id"], "active")
+        conv["status"] = "active"
 
-    # Если диалог уже переведён на владельца (истёкшая подписка или
-    # исчерпанный бесплатный лимит) — не шлём повторное уведомление на
-    # КАЖДОЕ следующее сообщение клиента, иначе владельца завалит спамом.
+    # Не спамим владельца уведомлениями на каждое сообщение уже эскалированного диалога.
     already_awaiting = conv.get("status") == "awaiting_human"
 
     if not subscription_active:
-        supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
-        if owner_id and not already_awaiting:
-            await notify_owner(owner_id, username, f"[Подписка истекла] {display_text}", conv["id"])
+        set_status(supabase, conv["id"], "awaiting_human")
+        if not already_awaiting:
+            await notify_owner(owner_id, username, display_text, conv["id"], HEADER_EXPIRED)
         return JSONResponse({"ok": True})
 
     if is_free_tier and free_tokens_used >= config.FREE_TIER_TOKEN_LIMIT:
-        supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
-        if owner_id and not already_awaiting:
+        set_status(supabase, conv["id"], "awaiting_human")
+        if not already_awaiting:
             await notify_owner_limit_reached(owner_id, config.FREE_TIER_TOKEN_LIMIT)
         return JSONResponse({"ok": True})
 
-    # Не-текстовые сообщения сразу эскалируем на владельца — ИИ по ним
-    # ничего не найдёт в базе знаний (search_knowledge_base вернёт "" при
-    # пустом тексте), поэтому нет смысла лишний раз дёргать Qwen/RAG.
+    used, period_start = get_usage(bot_row)
+    if plan_id:
+        plan_limit = get_plan_messages_limit(supabase, plan_id)
+        if plan_limit is not None and used >= plan_limit:
+            set_status(supabase, conv["id"], "awaiting_human")
+            if not already_awaiting:
+                await notify_owner(owner_id, username, display_text, conv["id"], HEADER_LIMIT)
+            return JSONResponse({"ok": True})
+
+    # Не-текст: ИИ ничего не найдёт — сразу владельцу.
     if not text:
-        supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
-        if owner_id:
-            await notify_owner(owner_id, username, display_text, conv["id"])
+        set_status(supabase, conv["id"], "awaiting_human")
+        await notify_owner(owner_id, username, display_text, conv["id"])
         return JSONResponse({"ok": True})
 
-    context, similarity = rag.search_knowledge_base(bot_id, text)
-
-    # Первое ли это сообщение клиента в диалоге? Нужно, чтобы не здороваться
-    # заново в каждом ответе (см. qwen_client.generate_reply).
     prior_assistant_msg = (
         supabase.table("messages")
         .select("id")
@@ -290,98 +285,56 @@ async def business_webhook(bot_id: str, request: Request):
     )
     is_first_message = not prior_assistant_msg
 
-    # Бот всегда пытается ответить сам — используя контекст базы знаний как
-    # приоритетный источник фактов, а при его отсутствии/нерелевантности
-    # отвечая общими знаниями. Эскалация происходит только если модель
-    # вернула служебный маркер ESCALATE (см. is_escalation выше).
-    reply, tokens_used = qwen_client.generate_reply(system_prompt, context, text, is_first_message)
-
-    # Учитываем расход токенов ТОЛЬКО для бесплатного тарифа — платные
-    # тарифы пока не лимитируются по токенам (см. lib/plans.ts messagesLimit
-    # на стороне Next.js, если понадобится добавить лимиты и для них).
-    if is_free_tier and tokens_used:
-        free_tokens_used += tokens_used
-        supabase.table("bots").update({"free_tokens_used": free_tokens_used}).eq("id", bot_id).execute()
-
-    if is_escalation(reply):
-        supabase.table("conversations").update({"status": "awaiting_human"}).eq("id", conv["id"]).execute()
-        PENDING_REPLIES.setdefault(owner_id, {})
+    # Блокирующие вызовы (эмбеддинг, LLM) — в пул потоков, чтобы не стопорить event loop.
+    try:
+        context, _similarity = await run_in_threadpool(rag.search_knowledge_base, bot_id, text)
+        reply, tokens_used = await run_in_threadpool(
+            qwen_client.generate_reply, system_prompt, context, text, is_first_message
+        )
+    except Exception as exc:
+        print(f"[business_webhook] ошибка ИИ для бота {bot_id}: {exc}")
+        set_status(supabase, conv["id"], "awaiting_human")
         if not already_awaiting:
-            await notify_owner(owner_id, username, text, conv["id"])
-    else:
-        await send_business_message(bot_token, business_connection_id, chat_id, reply)
-        supabase.table("messages").insert({
-            "conversation_id": conv["id"], "role": "assistant", "content": reply,
-        }).execute()
-
-    return JSONResponse({"ok": True})
-
-
-# ⚠️ НЕ РЕГИСТРИРОВАТЬ КАК WEBHOOK — см. пояснение в предыдущей версии файла.
-# Логика владелец-отвечает-клиенту и админ-панель теперь живут в Next.js
-# (app/api/bot/webhook/route.ts), т.к. у сервисного бота может быть только
-# один webhook URL.
-@app.post("/webhook/service")
-async def service_webhook(request: Request):
-    supabase = get_supabase()
-    update = await request.json()
-
-    callback = update.get("callback_query")
-    if callback:
-        data = callback["data"]
-        owner_id = callback["from"]["id"]
-        if data.startswith("reply:"):
-            conversation_id = data[len("reply:"):]
-            PENDING_REPLIES[owner_id] = {"conversation_id": conversation_id}
-            await tg_call(config.TELEGRAM_SERVICE_BOT_TOKEN, "sendMessage", {
-                "chat_id": owner_id,
-                "text": "Введите ответ для клиента одним сообщением:",
-            })
-        await tg_call(config.TELEGRAM_SERVICE_BOT_TOKEN, "answerCallbackQuery", {
-            "callback_query_id": callback["id"],
-        })
+            await notify_owner(owner_id, username, text, conv["id"], HEADER_ERROR)
         return JSONResponse({"ok": True})
 
-    message = update.get("message")
-    if message and "text" in message:
-        owner_id = message["from"]["id"]
-        pending = PENDING_REPLIES.get(owner_id)
-        if pending:
-            conversation_id = pending["conversation_id"]
-            conv = supabase.table("conversations").select("*, bots(*)").eq("id", conversation_id).single().execute().data
-            bot_row = conv["bots"]
+    if is_free_tier and tokens_used:
+        try:
+            supabase.table("bots").update(
+                {"free_tokens_used": free_tokens_used + tokens_used}
+            ).eq("id", bot_id).execute()
+        except Exception as exc:
+            print(f"[business_webhook] не удалось обновить free_tokens_used: {exc}")
 
-            await send_business_message(
-                bot_row["bot_api_token"],
-                conv.get("business_connection_id"),
-                conv["customer_chat_id"],
-                message["text"],
-            )
+    if is_escalation(reply):
+        set_status(supabase, conv["id"], "awaiting_human")
+        if not already_awaiting:
+            await notify_owner(owner_id, username, text, conv["id"])
+        return JSONResponse({"ok": True})
 
-            supabase.table("messages").insert({
-                "conversation_id": conversation_id, "role": "owner", "content": message["text"],
-            }).execute()
-            supabase.table("conversations").update({"status": "human_takeover"}).eq("id", conversation_id).execute()
+    try:
+        await send_business_message(bot_token, business_connection_id, chat_id, reply)
+    except Exception as exc:
+        # Не отдаём 500, иначе Telegram будет повторять апдейт и ИИ ответит дважды.
+        print(f"[business_webhook] не удалось отправить ответ клиенту: {exc}")
+        return JSONResponse({"ok": True})
 
-            del PENDING_REPLIES[owner_id]
-            await tg_call(config.TELEGRAM_SERVICE_BOT_TOKEN, "sendMessage", {
-                "chat_id": owner_id, "text": "Ответ отправлен клиенту ✅",
-            })
+    supabase.table("messages").insert({
+        "conversation_id": conv["id"], "role": "assistant", "content": reply,
+    }).execute()
+
+    # Учитываем отправленный ответ ИИ в лимите тарифа.
+    try:
+        supabase.table("bots").update({
+            "ai_replies_used": used + 1,
+            "ai_replies_period_start": period_start.isoformat(),
+        }).eq("id", bot_id).execute()
+    except Exception as exc:
+        print(f"[business_webhook] не удалось обновить счётчик ответов: {exc}")
 
     return JSONResponse({"ok": True})
 
 
 @app.get("/health")
-@app.get("/debug/env")
-async def debug_env():
-    import supabase as supabase_pkg
-    url = config.SUPABASE_URL
-    key = config.SUPABASE_SERVICE_ROLE_KEY
-    return {
-        "supabase_url_set": bool(url),
-        "supabase_url_preview": url[:20] + "..." if url else None,
-        "service_key_set": bool(key),
-        "service_key_length": len(key) if key else 0,
-        "service_key_prefix": key[:12] + "..." if key else None,
-        "supabase_package_version": getattr(supabase_pkg, "__version__", "unknown"),
-    }
+async def health():
+    return {"ok": True}
